@@ -1,0 +1,10 @@
+EMBEDFORGE 0.1.0 stack=4096
+READY
+PONG
+VAL 0 LOW
+OK FEED 800
+VAL 800 LOW
+OK THRESH 100
+VAL 800 LOW
+STATS rx=40 cmd=7 err=0 drop=0 ovr=0 sovr=* stackfree=*
+BYE

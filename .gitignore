@@ -1,0 +1,12 @@
+build/
+*.o
+*.elf
+*.map
+*.bin
+*.hex
+.DS_Store
+__pycache__/
+*.dSYM/
+
+# The raw AI build prompt: superseded by PROJECT_SPEC.md, not useful in the repo.
+BUILD_PROMPT.md

@@ -1,0 +1,79 @@
+name: ci
+
+# Three gates, in increasing cost order. The host tests are the ones that prove
+# the algorithms; the ARM build proves the image links inside its budget; QEMU
+# proves the whole thing boots and talks. A failure in any of them fails the
+# build -- none of this is advisory.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    name: host unit tests + sanitizers + cppcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck
+
+      - name: Compiler versions
+        run: |
+          cc --version
+          cppcheck --version
+
+      # -Werror is on for every host build, so a new warning fails here.
+      - name: Host unit tests
+        run: make test
+
+      # The fuzz tests are only worth their runtime under a sanitizer: an
+      # out-of-bounds write that happens to land in padding passes a plain
+      # build and aborts here.
+      - name: Host unit tests under ASan + UBSan
+        run: make test-san
+
+      - name: Static analysis
+        run: make cppcheck
+
+  firmware:
+    name: ARM firmware + footprint + no-heap + QEMU
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM toolchain and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi qemu-system-arm
+
+      - name: Toolchain versions
+        run: |
+          arm-none-eabi-gcc --version
+          qemu-system-arm --version
+
+      # Fails the link if the image does not fit the budget in bsp/linker.ld.
+      - name: Build firmware
+        run: make firmware
+
+      - name: No dynamic allocation
+        run: make no-heap
+
+      # Emulation, not silicon. See README.md for exactly what this does and
+      # does not establish.
+      - name: QEMU integration tests
+        run: make qemu
+
+      - name: Upload firmware and map
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            build/firmware.elf
+            build/firmware.map
+          if-no-files-found: error
