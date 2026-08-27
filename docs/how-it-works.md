@@ -274,6 +274,10 @@ deadlines — the backlog stays in the queue, which is what the queue is for.
 
 Defined by [`bsp/linker.ld`](../bsp/linker.ld) for the MPS2-AN385.
 
+Sizes below are from GCC 16.2.0; `.text` moves by a few dozen bytes on a
+different compiler (CI's GCC 13.2.1 gives 3,448 B). `make size` prints the
+figures for whichever toolchain is installed.
+
 ```
 0x00000000  FLASH, 128 KB budget
             .isr_vector    192 B    vector table: initial SP, then 15 core
@@ -287,6 +291,9 @@ Defined by [`bsp/linker.ld`](../bsp/linker.ld) for the MPS2-AN385.
                                     filter, task table
             .stack        4,096 B   the one and only stack
 ```
+
+The RAM side is compiler-independent: it is fixed by the data structures and
+the reserved stack, not by codegen.
 
 The board actually has 4 MB at each address. The budgets are deliberately much
 smaller — a realistic size for a part this firmware would ship on — so that the

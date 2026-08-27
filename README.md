@@ -30,22 +30,29 @@ then this is a finished project, not a résumé line.
 | Compiler warnings | `-Wall -Wextra -Werror` plus `-Wconversion -Wsign-conversion -Wshadow -Wcast-qual`, host and target |
 | `cppcheck` | clean (`warning,style,performance,portability`) |
 | Dynamic allocation | **none** — verified three ways, see below |
-| Footprint | **3,608 B flash / 4,960 B RAM**, enforced by the linker script |
+| Footprint | **3.6 KB flash / 4.8 KB RAM**, enforced by the linker script |
 | QEMU integration | **5 scenarios passing**, guest exits 0 on its own |
 
 ### Footprint
 
-From `arm-none-eabi-size -A` on the linked image (`make size`):
+From `arm-none-eabi-size -A` on the linked image (`make size`). Code size
+depends on the compiler, so the toolchain is named rather than left implied:
 
-| Section | Bytes | |
-|---|---:|---|
-| `.isr_vector` | 192 | vector table |
-| `.text` | 3,416 | code and read-only data |
-| `.data` | 0 | initialised globals |
-| `.bss` | 864 | zeroed globals |
-| `.stack` | 4,096 | reserved stack region |
-| **FLASH** | **3,608** | of 131,072 (2.75%) |
-| **RAM** | **4,960** | of 32,768 (15.14%) |
+| Section | GCC 16.2.0 | GCC 13.2.1 (CI) | |
+|---|---:|---:|---|
+| `.isr_vector` | 192 | 192 | vector table |
+| `.text` | 3,416 | 3,448 | code and read-only data |
+| `.data` | 0 | 0 | initialised globals |
+| `.bss` | 864 | 864 | zeroed globals |
+| `.stack` | 4,096 | 4,096 | reserved stack region |
+| **FLASH** | **3,608** | **3,640** | of 131,072 (2.75% / 2.78%) |
+| **RAM** | **4,960** | **4,960** | of 32,768 (15.14%) |
+
+The RAM figure is identical across both, because it is fixed by the data
+structures and the reserved stack rather than by codegen. Flash differs by
+32 bytes. Neither number is quoted anywhere in this repo without the
+compiler that produced it, and `make size` reprints them for whatever
+toolchain you have.
 
 The 128 KB / 32 KB budgets are not commentary — they are the `MEMORY` regions
 in [`bsp/linker.ld`](bsp/linker.ld), and the stack is a real section rather than
@@ -53,9 +60,10 @@ in [`bsp/linker.ld`](bsp/linker.ld), and the stack is a real section rather than
 colliding at runtime.
 
 Of the 4 KB stack, the firmware's measured high-water mark leaves about 3.6 KB
-untouched. That is a measurement, not an estimate: the reset handler paints the
-region with a known pattern before `main()`, and `STATS` reports how much of it
-has never been overwritten.
+untouched (it varies by a few dozen bytes with the compiler, for the same
+reason `.text` does). That is a measurement, not an estimate: the reset
+handler paints the region with a known pattern before `main()`, and `STATS`
+reports how much of it has never been overwritten.
 
 ### The no-heap guarantee
 
