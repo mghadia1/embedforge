@@ -122,10 +122,10 @@ CASES_LIST = [
         description="malformed input is rejected, and the parser recovers",
     ),
     Case(
-        "overflow",
+        "burst",
         "",  # the runner generates the flood
-        mode="overflow",
-        description="a burst that overruns the queue is counted, not fatal",
+        mode="burst",
+        description="a 1000-byte burst loses nothing silently",
     ),
     Case(
         "stream",
@@ -165,8 +165,25 @@ def run(qemu, elf, stdin_bytes, timeout=TIMEOUT_S):
         return out.decode("utf-8", "replace"), "timeout"
 
 
+# How many periodic reports the streaming case waits for before stopping. The
+# synthetic sensor sweeps a full triangle every 128 samples at 50 Hz, and a
+# report is emitted every 10 samples, so 20 reports is about 1.5 full sweeps --
+# comfortably enough for the debounced state to cross in both directions.
+STREAM_REPORTS_WANTED = 20
+
+
 def run_stream(qemu, elf):
-    """The streaming case needs input spread over time, not one burst."""
+    """Turn streaming on and wait for output, not for the clock.
+
+    An earlier version slept a fixed three seconds. That silently assumes how
+    fast QEMU emulates relative to real time, which is a property of the host:
+    on a slower runner three wall-clock seconds is not enough guest time for
+    the sensor to complete a sweep, and the run fails for a reason that has
+    nothing to do with the firmware. Waiting until the firmware has actually
+    produced N reports makes the case depend on guest progress instead, with
+    the wall clock demoted to a hang backstop.
+    """
+    import select
     import time
 
     proc = subprocess.Popen(
@@ -178,29 +195,58 @@ def run_stream(qemu, elf):
     try:
         proc.stdin.write(b"STREAM ON\n")
         proc.stdin.flush()
-        time.sleep(3.0)          # several report periods at 5 Hz
+
+        collected = b""
+        deadline = time.time() + TIMEOUT_S / 2.0
+        while time.time() < deadline:
+            if collected.count(b"VAL ") >= STREAM_REPORTS_WANTED:
+                break
+            ready, _, _ = select.select([proc.stdout], [], [], 0.25)
+            if ready:
+                chunk = os.read(proc.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                collected += chunk
+
         proc.stdin.write(b"STREAM OFF\nSTATS\nQUIT\n")
         proc.stdin.flush()
-        out, _ = proc.communicate(timeout=TIMEOUT_S)
-        return out.decode("utf-8", "replace"), proc.returncode
+        rest, _ = proc.communicate(timeout=TIMEOUT_S)
+        return (collected + rest).decode("utf-8", "replace"), proc.returncode
     except subprocess.TimeoutExpired:
         proc.kill()
-        out, _ = proc.communicate()
-        return out.decode("utf-8", "replace"), "timeout"
+        rest, _ = proc.communicate()
+        return (collected + rest).decode("utf-8", "replace"), "timeout"
 
 
-def run_overflow(qemu, elf):
-    """Deliberately overrun the receive queue, then check the firmware lives.
+# The burst case sends 200 PING commands at once, then resynchronises and asks
+# for STATS. These are the byte counts it expects to have been received by the
+# time the firmware processes that STATS.
+BURST_COMMANDS = 200
+BURST_BYTES = BURST_COMMANDS * len("PING\n")          # 1000
+RESYNC_AND_STATS = len("\nSTATS\n")                    # 7
+BURST_TOTAL = BURST_BYTES + RESYNC_AND_STATS          # 1007
 
-    QEMU hands the UART bytes as fast as the ISR reads them -- there is no baud
-    rate in the model -- so a large burst arrives far faster than the 1 kHz
-    comms task drains it, and the 256-byte queue overflows. On real hardware at
-    115200 baud this burst would take about 90 ms to arrive and the queue would
-    never fill; here it is a free way to exercise the drop path for real
-    instead of only in the host unit tests.
 
-    What is being asserted is the design contract: overflow loses bytes, counts
-    every one of them, and leaves the firmware fully functional afterwards.
+def run_burst(qemu, elf):
+    """Fire a burst far larger than the receive queue, then check nothing was
+    lost silently.
+
+    QEMU hands the UART bytes as fast as the guest will take them, with no baud
+    rate in the model. Whether that outruns the 1 kHz comms task depends on how
+    fast the host is emulating relative to the guest's own clock -- so on one
+    machine the 256-byte queue overflows and on another all 1000 bytes get
+    through. Both are legitimate.
+
+    So this case deliberately does NOT assert that an overflow happened. That
+    would be a claim about the host, and the deterministic overflow tests live
+    in tests/test_ringbuf.c where they belong. What it asserts instead is the
+    invariant that holds either way:
+
+        every byte the ISR accepted was either parsed or counted as dropped
+
+    Nothing may vanish. If the queue did overflow, the loss is visible in
+    drop= and the command straddling it must be rejected rather than
+    mis-parsed; if it did not, every command must have been answered.
     """
     import time
 
@@ -212,15 +258,14 @@ def run_overflow(qemu, elf):
     )
     try:
         time.sleep(0.5)
-        proc.stdin.write(b"PING\n" * 200)   # 1000 bytes at once, queue is 256
+        proc.stdin.write(b"PING\n" * BURST_COMMANDS)
         proc.stdin.flush()
         time.sleep(2.0)
-        # A bare newline first, to resynchronise. When the queue overflows, the
-        # bytes lost are in the middle of a line, so the parser is left holding
-        # a partial command; the next thing sent would be glued onto it and
-        # rejected. Terminating that stump is exactly how a real host recovers
-        # a line protocol, and the ERR UNKNOWN it produces is asserted below
-        # rather than hidden.
+        # A bare newline first, to resynchronise. If the queue overflowed, the
+        # bytes lost were in the middle of a line, so the parser is left
+        # holding a partial command; the next thing sent would be glued onto it
+        # and rejected. Terminating that stump is how a real host recovers a
+        # line protocol.
         proc.stdin.write(b"\nSTATS\nPING\nQUIT\n")
         proc.stdin.flush()
         out, _ = proc.communicate(timeout=TIMEOUT_S)
@@ -231,46 +276,62 @@ def run_overflow(qemu, elf):
         return out.decode("utf-8", "replace"), "timeout"
 
 
-def check_overflow(out):
+def check_burst(out):
     problems = []
     lines = [l for l in out.split("\n") if l]
-
     pongs = [l for l in lines if l == "PONG"]
-    if not pongs:
-        problems.append("no command survived the burst at all")
-    if len(pongs) >= 201:
-        problems.append(
-            "expected the queue to drop some of a 1000-byte burst, but all "
-            "%d commands got through" % len(pongs)
-        )
-
-    # The truncated command left over from the overflow must be rejected, not
-    # silently accepted as something else.
-    if "ERR UNKNOWN" not in lines:
-        problems.append(
-            "expected the command straddling the drop to be rejected"
-        )
 
     stats = [l for l in lines if l.startswith("STATS ")]
     if not stats:
         problems.append("no STATS line: the firmware stopped responding")
-    else:
-        m = re.search(r"drop=(\d+)", stats[-1])
-        if not m:
-            problems.append("STATS has no drop counter: %r" % stats[-1])
-        elif int(m.group(1)) == 0:
+        return problems
+
+    fields = dict(re.findall(r"(\w+)=(\d+)", stats[-1]))
+    missing = {"rx", "drop", "ovr"} - set(fields)
+    if missing:
+        problems.append("STATS is missing %s: %r" % (sorted(missing), stats[-1]))
+        return problems
+
+    rx = int(fields["rx"])
+    drop = int(fields["drop"])
+
+    # The invariant. Every byte sent up to and including the STATS newline was
+    # either handed to the parser or refused by a full queue -- none went
+    # missing in between.
+    if rx + drop != BURST_TOTAL:
+        problems.append(
+            "conservation failed: rx=%d + drop=%d = %d, but %d bytes were sent "
+            "before that STATS -- %d bytes are unaccounted for"
+            % (rx, drop, rx + drop, BURST_TOTAL, BURST_TOTAL - (rx + drop))
+        )
+
+    # Whatever happened at the queue, the ISR itself must have kept up: a
+    # hardware overrun would mean bytes lost before the queue ever saw them.
+    if int(fields["ovr"]) != 0:
+        problems.append(
+            "hardware receive overrun: the ISR fell behind, %r" % stats[-1]
+        )
+
+    if drop > 0:
+        # The queue overflowed. The loss must be visible in the command count,
+        # and the command straddling it must be rejected, not mis-parsed.
+        if len(pongs) >= BURST_COMMANDS + 1:
             problems.append(
-                "the burst did not actually overflow the queue (drop=0), so "
-                "this case proved nothing"
+                "drop=%d says bytes were lost, but all %d commands were "
+                "answered" % (drop, len(pongs))
             )
-        # The bytes lost were lost in the ring buffer, not in the hardware:
-        # the ISR kept up, which is the point of doing the work there.
-        if "ovr=0" not in stats[-1]:
+        if "ERR UNKNOWN" not in lines:
             problems.append(
-                "hardware receive overrun: the ISR fell behind, %r" % stats[-1]
+                "expected the command straddling the drop to be rejected"
+            )
+    else:
+        # No overflow on this host: then nothing may have been lost at all.
+        if len(pongs) != BURST_COMMANDS + 1:
+            problems.append(
+                "drop=0 says nothing was lost, but %d of %d commands were "
+                "answered" % (len(pongs), BURST_COMMANDS + 1)
             )
 
-    # Still alive and correct after the flood.
     if not out.rstrip().endswith("BYE"):
         problems.append("firmware did not shut down cleanly after the burst")
     return problems
@@ -348,12 +409,14 @@ def check_stream(out):
         problems.append("streaming was never turned off")
 
     vals = [l for l in lines if l.startswith("VAL ")]
-    # 3 seconds at a 200 ms report period is about 15 reports. Anything in a
-    # wide band proves the periodic task ran on schedule without asserting a
-    # precise count, which would be a timing claim the emulator cannot support.
-    if not 5 <= len(vals) <= 40:
+    # The runner waits for this many reports rather than for a fixed time, so
+    # falling short means the periodic task stopped, not that the host was
+    # slow. A couple may arrive after the STREAM OFF is queued, hence the
+    # upper slack.
+    if len(vals) < STREAM_REPORTS_WANTED:
         problems.append(
-            "expected roughly 15 periodic reports in 3 s, got %d" % len(vals)
+            "expected at least %d periodic reports, got %d -- the report task "
+            "stopped running" % (STREAM_REPORTS_WANTED, len(vals))
         )
 
     for l in vals:
@@ -406,8 +469,8 @@ def main():
     for case in CASES_LIST:
         if case.mode == "stream":
             out, rc = run_stream(qemu, args.elf)
-        elif case.mode == "overflow":
-            out, rc = run_overflow(qemu, args.elf)
+        elif case.mode == "burst":
+            out, rc = run_burst(qemu, args.elf)
         else:
             out, rc = run(qemu, args.elf, case.script.encode())
         raw = normalise(out)
@@ -420,9 +483,9 @@ def main():
             failures += 1
             continue
 
-        if case.mode in ("stream", "overflow"):
+        if case.mode in ("stream", "burst"):
             problems = (check_stream(raw) if case.mode == "stream"
-                        else check_overflow(raw))
+                        else check_burst(raw))
             problems += check_stats_sanity(raw)
             if problems:
                 print("FAIL %-12s %s" % (case.name, case.description))
@@ -436,9 +499,11 @@ def main():
                       % (case.name, case.description, n))
             else:
                 stats = [l for l in raw.split("\n") if l.startswith("STATS ")]
-                drops = re.search(r"drop=(\d+)", stats[-1]).group(1)
-                print("ok   %-12s %s (%s bytes dropped, ISR kept up)"
-                      % (case.name, case.description, drops))
+                drops = int(re.search(r"drop=(\d+)", stats[-1]).group(1))
+                how = ("queue overflowed, %d bytes dropped and accounted for"
+                       % drops) if drops else "queue kept up, nothing dropped"
+                print("ok   %-12s %s (%s)"
+                      % (case.name, case.description, how))
             continue
 
         sanity = check_stats_sanity(raw)

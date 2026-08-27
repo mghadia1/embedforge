@@ -119,10 +119,10 @@ electrical behaviour, or a real sensor. There is no sensor here; the streaming
 mode reports a deterministic synthetic waveform, and says so in the source.
 
 Five scenarios run: every command with its counters, the filter's averaging and
-debounce end to end, malformed input and recovery, a deliberate queue overflow,
-and the periodic tasks under the scheduler. Three are compared byte-for-byte
-against committed fixtures; two assert on structure, because how many periodic
-reports land in three seconds is a property of the host, not of the firmware.
+debounce end to end, malformed input and recovery, a 1,000-byte burst into a
+256-byte queue, and the periodic tasks under the scheduler. Three are compared
+byte-for-byte against committed fixtures; two assert on structure, for the
+reason in the next section.
 
 ### The protocol
 
@@ -168,6 +168,41 @@ compiler.
 the string-append truncation rule, so a number that did not fit was truncated
 mid-digits: `VAL 999999` could be emitted as `VAL 99`. A visibly missing value
 is recoverable; a wrong one that looks valid is not. It is now all-or-nothing.
+
+## And one lesson about the tests themselves
+
+Three of the first-draft QEMU assertions were not testing the firmware at all.
+They were testing the host, and CI caught each of them by disagreeing with a
+laptop:
+
+- **`sovr=0`** — the count of missed scheduler deadlines. A 1 ms task running
+  late under an emulator says something about how busy the runner was. The
+  counter existing and being reported is the feature; a fixed value is not.
+- **`stackfree=3636`** — a real measurement, and perfectly deterministic for a
+  given binary, but a different GCC lays out frames differently. Pinning it
+  turns a toolchain upgrade into a test failure.
+- **"the queue must overflow"** — QEMU feeds the UART with no baud rate, so
+  whether a 1,000-byte burst outruns the 1 kHz drain depends on emulation
+  speed. On one runner it overflowed; on another every byte got through. Both
+  are legitimate.
+
+The last one was the instructive one, because the fix was not to loosen the
+assertion but to find the invariant that is actually true either way:
+
+```
+rx + drop == bytes sent
+```
+
+Every byte the ISR accepted was either parsed or counted as dropped. Nothing
+vanishes. That holds whether or not the queue overflows, it fails loudly if the
+accounting is ever wrong, and it says something about the firmware rather than
+about the machine it ran on. The deterministic overflow tests live in
+`tests/test_ringbuf.c`, where a queue can be filled exactly on purpose.
+
+Likewise, the streaming case now waits until the firmware has produced twenty
+reports rather than sleeping three seconds and hoping. A test that fails for
+reasons unrelated to the code trains you to ignore it, which is worse than not
+having it.
 
 ## Layout
 
